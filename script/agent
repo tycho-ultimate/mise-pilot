@@ -1,0 +1,205 @@
+#!/bin/sh
+# script/agent: this project's entry point for crew (tycho-ultimate/crew, BRIEF D3).
+#
+#   script/agent doctor           does this account have what the project needs? (mise and the tools in mise.toml)
+#   script/agent session <task>   start or resume work on <task>, in the foreground
+#
+# Exit codes (sysexits.h, as crew reads them):
+#   0   ok
+#   64  a bad task id, or bad usage
+#   69  a missing prerequisite: git, mise, a declared tool, a CREW_* variable
+#   75  retry later: another session on this task is running in this clone
+#   77  forbidden: a session as root, or a session for the verifier role
+#
+# Environment, set by crew and never secret: CREW_API=1, CREW_PROJECT, CREW_ROLE (implementer or verifier),
+# CREW_MACHINE, CREW_TASK. session needs all of them but CREW_TASK. doctor checks the ones that are set, so a
+# person or CI can run it without crew.
+#
+# Rules (CLAUDE.md): this runs only inside the project's agent account or CI, never as the owner. It is POSIX
+# sh and passes shellcheck. It never calls sudo, never reads or prints a secret, never echoes a value it
+# refused, and puts nothing but validated names on a command line.
+set -u
+LC_ALL=C
+export LC_ALL
+umask 077
+
+me=script/agent
+root=$(cd "$(dirname "$0")/.." && pwd -P) || exit 69
+
+say() { printf '%s: %s\n' "$me" "$*"; }
+die() {
+  rc=$1
+  shift
+  printf '%s: %s\n' "$me" "$*" >&2
+  exit "$rc"
+}
+
+usage() {
+  printf '%s\n' "usage: script/agent doctor" "       script/agent session <task>"
+}
+
+# crew's task-id charset (BRIEF D8): a letter or digit, then at most 63 letters, digits, dots, underscores or
+# dashes. Used for every name that may reach a command line or the screen.
+valid_name() {
+  case $1 in
+    '' | [!A-Za-z0-9]* | *[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  [ "${#1}" -le 64 ]
+}
+
+# One CREW_* variable: <name> <value> <required|optional>.
+crew_var() {
+  if [ -z "$2" ]; then
+    [ "$3" = required ] && die 69 "$1 is not set (crew sets it)"
+    return 0
+  fi
+  valid_name "$2" || die 69 "$1 is not a valid name"
+}
+
+crew_env() {   # required | optional
+  if [ "${CREW_API-}" != 1 ] && { [ "$1" = required ] || [ -n "${CREW_API-}" ]; }; then
+    die 69 "CREW_API must be 1 (this script speaks crew's harness API 1)"
+  fi
+  crew_var CREW_PROJECT "${CREW_PROJECT-}" "$1"
+  crew_var CREW_ROLE "${CREW_ROLE-}" "$1"
+  crew_var CREW_MACHINE "${CREW_MACHINE-}" "$1"
+  case ${CREW_ROLE-} in
+    '' | implementer | verifier) ;;
+    *) die 69 "CREW_ROLE must be implementer or verifier" ;;
+  esac
+}
+
+# Each tool mise.toml declares, and whether it is installed. Prints one line per tool. Returns 0 when all are
+# installed (or none is declared), 69 when mise is missing, cannot read the config, or a tool is not installed.
+# `mise ls` reads the config and installs nothing; the safe subset in mise.toml loads without `mise trust`.
+check_tools() {
+  if ! command -v mise >/dev/null 2>&1; then
+    say "mise: not found on PATH. Install it in this account (https://mise.jdx.dev/installing-mise.html), then run in this clone: mise install"
+    return 69
+  fi
+  if ! json=$(cd "$root" && MISE_AUTO_INSTALL=0 mise ls --local --json 2>/dev/null </dev/null); then
+    say "mise could not read this project's config (too old for min_version, or a feature that needs trust):"
+    (cd "$root" && MISE_AUTO_INSTALL=0 mise ls --local --json 2>&1 >/dev/null </dev/null) | head -n 3 \
+      | tr -c 'A-Za-z0-9 ._,:/=@()`+\n-' '?' | sed 's/^/    /'
+    return 69
+  fi
+  # mise's JSON: { "<tool>": [ { "version": "...", ..., "installed": true|false, ... }, ... ], ... }
+  list=$(printf '%s\n' "$json" | awk '
+    /^  "[^"]*": *\[/ { t = $0; sub(/^  "/, "", t); sub(/".*/, "", t); v = ""; i = ""; next }
+    /^ *"version": *"/ { v = $0; sub(/^ *"version": *"/, "", v); sub(/".*/, "", v) }
+    /^ *"installed": *(true|false)/ { i = ($0 ~ /true/) ? "yes" : "no" }
+    t != "" && v != "" && i != "" { print t, v, i; v = ""; i = "" }
+  ' | tr -c 'A-Za-z0-9._:@/+ \n-' '?')
+  n=0
+  missing=0
+  while read -r t v i; do
+    [ -n "$t" ] || continue
+    n=$((n + 1))
+    if [ "$i" = yes ]; then
+      say "tool $t $v: installed"
+    else
+      say "tool $t $v: not installed"
+      missing=$((missing + 1))
+    fi
+  done <<EOF
+$list
+EOF
+  if [ "$n" -eq 0 ]; then
+    say "no tools declared in mise.toml"
+    return 0
+  fi
+  if [ "$missing" -gt 0 ]; then
+    say "$missing of $n tools are not installed; run in this clone: mise install"
+    return 69
+  fi
+  [ -f "$root/mise.lock" ] || say "note: no mise.lock; run mise lock and commit it"
+  return 0
+}
+
+doctor() {
+  [ $# -eq 0 ] || { usage >&2; exit 64; }
+  crew_env optional
+  if [ -n "${CREW_TASK-}" ] && ! valid_name "$CREW_TASK"; then
+    die 64 "CREW_TASK is not a valid task id"
+  fi
+  if [ -n "${CREW_PROJECT-}" ]; then
+    say "project ${CREW_PROJECT}, role ${CREW_ROLE:-unset}, machine ${CREW_MACHINE:-unset}"
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    say "git: not found on PATH"
+    exit 69
+  fi
+  check_tools
+  rc=$?
+  [ "$rc" -eq 0 ] && say "doctor: ok"
+  exit "$rc"
+}
+
+# A per-task lock in this clone's git dir, so two sessions never work one task in one clone. The lock holds the
+# session's pid; a lock whose pid is gone is stale and is taken over.
+lock_task() {   # <task>
+  gitdir=$(git -C "$root" rev-parse --absolute-git-dir 2>/dev/null </dev/null) \
+    || die 69 "this clone is not a git repository that git will read"
+  mkdir -p "$gitdir/agent-sessions" || die 69 "cannot create the session lock directory"
+  lock=$gitdir/agent-sessions/$1.lock
+  if ! mkdir "$lock" 2>/dev/null; then
+    pid=$(cat "$lock/pid" 2>/dev/null) || pid=
+    case $pid in
+      '' | *[!0-9]*)
+        die 75 "a session on this task is starting in this clone; retry later (if none is, remove $lock)" ;;
+    esac
+    if kill -0 "$pid" 2>/dev/null; then
+      die 75 "a session on this task is running in this clone (pid $pid); retry when it ends"
+    fi
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || die 75 "a session on this task just started in this clone; retry later"
+  fi
+  printf '%s\n' "$$" >"$lock/pid"
+}
+
+# THE PLACE A PROJECT CHANGES: what a session runs, in the clone, with CREW_TASK exported. This default opens
+# the account's login shell with the tools from mise.toml on PATH, for the agent or a person to work in.
+# Replace it with your agent's launch. The task id is the only value from crew, and it is already validated.
+start_session() {   # <task>
+  shell=${SHELL:-/bin/sh}
+  case $shell in /*) ;; *) shell=/bin/sh ;; esac
+  [ -x "$shell" ] || shell=/bin/sh
+  if command -v mise >/dev/null 2>&1; then
+    mise exec -- "$shell" -i
+  else
+    "$shell" -i
+  fi
+}
+
+session() {
+  [ $# -eq 1 ] || { usage >&2; exit 64; }
+  task=$1
+  valid_name "$task" || die 64 "the task id is not valid: it must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\$"
+  crew_env required
+  if [ -n "${CREW_TASK-}" ] && [ "$CREW_TASK" != "$task" ]; then
+    die 64 "CREW_TASK and the task argument differ"
+  fi
+  [ "$(id -u)" != 0 ] || die 77 "refusing to run as root: sessions run in the project's unprivileged agent account"
+  [ "$CREW_ROLE" != verifier ] || die 77 "the verifier role does not start sessions; it runs verify from its pinned copy"
+  command -v git >/dev/null 2>&1 || die 69 "git: not found on PATH"
+  cd "$root" || die 69 "cannot enter the clone"
+  lock_task "$task"
+  trap 'rm -rf "$lock"' EXIT
+  say "session: task $task, project $CREW_PROJECT, role $CREW_ROLE, machine $CREW_MACHINE"
+  # A missing tool is a note, and the session goes on (crew TOOL-1 decision T4): the session may install it.
+  check_tools >&2 || say "note: not every declared tool is installed; the session goes on" >&2
+  CREW_TASK=$task
+  export CREW_TASK
+  # Ctrl-C and a closing terminal go to the session; this script waits for it, then removes the lock.
+  trap : INT HUP TERM QUIT
+  start_session "$task"
+  exit $?
+}
+
+case ${1-} in
+  doctor) shift; doctor "$@" ;;
+  session) shift; session "$@" ;;
+  verify) die 69 "verify: this project has no verifier harness yet (BRIEF D3, section 5)" ;;
+  -h | --help | help) usage ;;
+  *) usage >&2; exit 64 ;;
+esac

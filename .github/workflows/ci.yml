@@ -1,0 +1,44 @@
+# CI for this project. mise installs the tools mise.toml declares: the same versions the agent accounts and
+# your own machine use. Then shellcheck and the tests for script/agent, the project's own tests, and
+# `script/agent doctor`. It needs no secret.
+#
+# Every action is pinned by its full commit SHA, with the tag beside it. To bump one, look the SHA up with
+#   git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>' 'refs/tags/<tag>^{}'
+# (the ^{} line, when there is one, is the commit an annotated tag points to).
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+        with:
+          version: "2026.10.1"   # keep min_version in mise.toml at or below this; raise the two together
+      - name: Tool versions
+        run: |
+          mise --version
+          mise ls --local
+      - name: shellcheck
+        run: mise exec shellcheck@0.11.0 -- shellcheck script/agent tests/*.sh
+      - name: tests/script-agent.sh
+        run: |
+          tests/script-agent.sh
+          AGENT_SH=bash tests/script-agent.sh
+      - name: Tests (this project's own go here)
+        run: echo "no project tests yet; add them here, and run them through the tools in mise.toml"
+      - name: script/agent doctor
+        run: script/agent doctor

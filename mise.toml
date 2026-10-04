@@ -1,0 +1,10 @@
+# This project's tools. mise reads this file in the agent accounts, on your machine and in CI
+# (.github/workflows/ci.yml), so all three use the same versions.
+#
+# Keep it to the safe subset (CLAUDE.md): min_version, and plain pinned versions under [tools]. No [env],
+# hooks, [tasks], [plugins], include or [settings] without the owner's approval.
+min_version = "2026.10.1"   # the mise version CI pins; raise the two together
+
+[tools]
+# One line per tool, an exact version. Then run `mise install` and `mise lock`, and commit mise.lock.
+# python = "3.13.7"
