@@ -7,4 +7,4 @@ min_version = "2026.10.1"   # the mise version CI pins; raise the two together
 
 [tools]
 # One line per tool, an exact version. Then run `mise install` and `mise lock`, and commit mise.lock.
-# python = "3.13.7"
+python = "3.13.7"
